@@ -1,0 +1,1195 @@
+---
+title: "RNA-seq analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# RNA-seq analysis
+
+```{r, warning=FALSE, message=FALSE}
+# Load libraries and custom functions -----------------------------------------
+library(easypackages)
+libraries("here","ggplot2","WGCNA","limma","statmod","edgeR","biomaRt",
+          "sva","patchwork","Biobase","reshape2","genefilter","variancePartition",
+          "BiocParallel","tidyverse","gplots","enrichR","ggrepel","glue","ggtext")
+source(here("code","utils.R"))
+
+# Various parameters to set ---------------------------------------------------
+# set FDR thresh
+fdr_qThresh = 0.05
+minReads = 100
+varianceFilterCutoff = 0.15
+nsv = 2
+
+# Paths -----------------------------------------------------------------------
+# paths
+root_path = here()
+data_path = here("data")
+code_path = here("code")
+plot_path = here("plots")
+result_path = here("results")
+res_path = file.path(result_path,"filt","sva")
+
+# load data -------------------------------------------------------------------
+# read count data
+reads_file = file.path(data_path,"tidy_reads.csv")
+reads_data = read.csv(reads_file)
+
+# sample meta data
+meta_file = file.path(data_path,"tidy_metadata.csv")
+meta_data = read.csv(meta_file)
+colnames(reads_data)[4:ncol(reads_data)] = meta_data$sample_id
+
+# mouse gene meta data - from utils::getGeneMetaData
+gene_metadata_file = file.path(data_path,"tidy_gene_meta_data.csv")
+gene_meta_data = read.csv(gene_metadata_file,row.names = 1)
+
+# mouse to human homolog gene meta data - from utils::getHumanHomolog
+hsap_homolog_metadata_file = file.path(data_path,"tidy_human_homolog_gene_meta_data.csv")
+hsap_homolog_gene_meta_data = read.csv(hsap_homolog_metadata_file)
+
+# set up expression and meta data matrices ------------------------------------
+
+# PFC data
+pfc_names = meta_data$sample_id[meta_data$brain_region=="PFC"]
+exprs_pfc = reads_data[,pfc_names]
+rownames(exprs_pfc) = reads_data$ensembl_id
+meta_data_pfc = subset(meta_data, meta_data$brain_region=="PFC")
+
+# HYT 
+hyt_names = meta_data$sample_id[meta_data$brain_region=="HYT"]
+exprs_hyt = reads_data[,hyt_names]
+rownames(exprs_hyt) = reads_data$ensembl_id
+meta_data_hyt = subset(meta_data, meta_data$brain_region=="HYT")
+```
+
+## Preprocessing
+
+```{r, warning=FALSE, message=FALSE}
+### PCA to summarize the Picard sequencing variables --------------------------
+npcs2use = 10
+seq_vars2use = c("PCT_CODING_BASES","PCT_UTR_BASES","PCT_INTRONIC_BASES",
+                 "PCT_INTERGENIC_BASES","MEDIAN_CV_COVERAGE","MEDIAN_5PRIME_BIAS",
+                 "ALIGNED_READS","AT_DROPOUT")
+
+# PFC data
+pca_res_seq_pfc = prcomp(meta_data_pfc[,seq_vars2use], center = TRUE, scale = TRUE)
+meta_data_pfc = cbind(meta_data_pfc, pca_res_seq_pfc$x)
+summary(pca_res_seq_pfc)
+
+# HYT data
+pca_res_seq_hyt = prcomp(meta_data_hyt[,seq_vars2use], center = TRUE, scale = TRUE)
+meta_data_hyt = cbind(meta_data_hyt, pca_res_seq_hyt$x)
+summary(pca_res_seq_hyt)
+
+
+### Filtering ------------------------------------------------------------------
+
+# PFC only 
+genes2keep = rowSums(exprs_pfc>minReads)>=2
+
+# genes to throw out
+tossedOutData = exprs_pfc[!genes2keep,]
+
+# grab only genes to keep
+exprs_filt_pfc = exprs_pfc[genes2keep,]
+
+sprintf("Genes before filtering out low reads = %d",dim(exprs_pfc)[1])
+sprintf("Genes after filtering out low reads = %d",dim(exprs_filt_pfc)[1])
+
+sprintf("Max reads for any gene tossed out = %d",max(as.matrix(tossedOutData)))
+sprintf("Mean reads for any gene tossed out = %f",mean(as.matrix(tossedOutData)))
+sprintf("Median reads for any gene tossed out = %f",median(as.matrix(tossedOutData)))
+
+genes_before = dim(exprs_filt_pfc)[1]
+exprs_filt_pfc = varFilter(as.matrix(exprs_filt_pfc), var.cutoff = varianceFilterCutoff)
+genes_after = dim(exprs_filt_pfc)[1]
+
+print(sprintf("Genes before variance filtering at %.02f = %d",varianceFilterCutoff,genes_before))
+print(sprintf("Genes after variance filtering at %.02f = %d",varianceFilterCutoff,genes_after))
+
+
+# HYT only 
+genes2keep = rowSums(exprs_hyt>minReads)>=2
+
+# genes to throw out
+tossedOutData = exprs_hyt[!genes2keep,]
+
+# grab only genes to keep
+exprs_filt_hyt = exprs_hyt[genes2keep,]
+
+sprintf("Genes before filtering out low reads = %d",dim(exprs_hyt)[1])
+sprintf("Genes after filtering out low reads = %d",dim(exprs_filt_hyt)[1])
+
+sprintf("Max reads for any gene tossed out = %d",max(as.matrix(tossedOutData)))
+sprintf("Mean reads for any gene tossed out = %f",mean(as.matrix(tossedOutData)))
+sprintf("Median reads for any gene tossed out = %f",median(as.matrix(tossedOutData)))
+
+genes_before = dim(exprs_filt_hyt)[1]
+exprs_filt_hyt = varFilter(as.matrix(exprs_filt_hyt), var.cutoff = varianceFilterCutoff)
+genes_after = dim(exprs_filt_hyt)[1]
+
+print(sprintf("Genes before variance filtering at %.02f = %d",varianceFilterCutoff,genes_before))
+print(sprintf("Genes after variance filtering at %.02f = %d",varianceFilterCutoff,genes_after))
+
+### Scale data by library size ------------------------------------------------
+
+# turn into DGEList object
+dge_pfc = DGEList(counts=exprs_filt_pfc)
+dge_hyt = DGEList(counts=exprs_filt_hyt)
+
+# Calculate normalization factors to scale the raw library sizes.
+dgeN_pfc = calcNormFactors(dge_pfc, method="TMM")
+dgeN_hyt = calcNormFactors(dge_hyt, method="TMM")
+
+
+### Run voom to get log-CPM and precision weights for DE model ----------------
+
+# PFC only --------------------------------------------------------------------
+# make design matrix for modeling with voom
+form2use = ~ group*sex + RIN
+design_pfc = model.matrix(form2use, data = meta_data_pfc)
+
+# use voom to calculate precision weights plus output count data as logCPM
+v_pfc = voom(dgeN_pfc, design_pfc, plot=TRUE)
+voomed_edata_pfc = v_pfc$E
+voomed_precision_weights_pfc = v_pfc$weights
+
+# HYT only --------------------------------------------------------------------
+# make design matrix for modeling with voom
+form2use = ~ group*sex + RIN
+design_hyt = model.matrix(form2use, data = meta_data_hyt)
+
+# use voom to calculate precision weights plus output count data as logCPM
+v_hyt = voom(dgeN_hyt, design_hyt, plot=TRUE)
+voomed_edata_hyt = v_hyt$E
+voomed_precision_weights_hyt = v_hyt$weights
+
+
+### Plot final preprocessed data ----------------------------------------------
+
+# PFC plot data
+x = melt(as.matrix(v_pfc$E))
+colnames(x) = c('gene_name', 'sample_id', 'value')
+ggplot(x, aes(x=value, color=sample_id)) + geom_density()
+
+# HYT plot data
+x = melt(as.matrix(v_hyt$E))
+colnames(x) = c('gene_name', 'sample_id', 'value')
+ggplot(x, aes(x=value, color=sample_id)) + geom_density()
+
+
+### PCA on preprocessed expression data ---------------------------------------
+
+# PFC -------------------------------------------------------------------------
+pca_expr_pfc = prcomp(t(v_pfc$E), center = TRUE, scale = TRUE)  
+summary(pca_expr_pfc)
+
+# HYT -------------------------------------------------------------------------
+pca_expr_hyt = prcomp(t(v_hyt$E), center = TRUE, scale = TRUE)  
+summary(pca_expr_hyt)
+
+
+### Surrogate Variable Analysis (SVA) -----------------------------------------
+
+# basic model before SVA
+svaform2use = ~ group*sex + RIN
+
+
+# PFC 
+sva_res_pfc = runSVA(expr_data = v_pfc$E, 
+                       meta_data = meta_data_pfc, 
+                       form2use = svaform2use, 
+                       nsv = nsv, 
+                       svestMethod = "leek")
+# new meta_data data frame with the SVs
+meta_data_pfc = sva_res_pfc$meta_data
+# new model to use later in DE model, which incorporates SVs
+form4model_pfc = sva_res_pfc$form2use
+
+# HYT
+sva_res_hyt = runSVA(expr_data = v_hyt$E, 
+                       meta_data = meta_data_hyt, 
+                       form2use = svaform2use, 
+                       nsv = nsv, 
+                       svestMethod = "leek")
+# new meta_data data frame with the SVs
+meta_data_hyt = sva_res_hyt$meta_data
+# new model to use later in DE model, which incorporates SVs
+form4model_hyt = sva_res_hyt$form2use
+
+
+
+### Plot heatmaps -------------------------------------------------------------
+
+# PFC 
+# plot correlations of PCA of expression data against PCA of sequencing-related variables 
+r_mat = cor(pca_expr_pfc$x, pca_res_seq_pfc$x)
+heatmap.2(r_mat,
+          col = blueWhiteRed(50),
+          Rowv = TRUE, 
+          trace = "none",
+          cellnote= round(as.matrix(r_mat),digits = 2), 
+          notecol = "black",
+          notecex=0.9,
+          density.info = "none", 
+          key.xlab ="Correlation (r)")
+print(r_mat)
+
+
+# plot correlations of PCA of expression data against SVs from SVA 
+r_mat = cor(pca_expr_pfc$x, sva_res_pfc$meta_data[,sva_res_pfc$sv_names])
+heatmap.2(r_mat,
+          col = blueWhiteRed(50),
+          Rowv = TRUE, 
+          trace = "none",
+          cellnote= round(as.matrix(r_mat),digits = 2), 
+          notecol = "black",
+          notecex=0.9,
+          density.info = "none", 
+          key.xlab ="Correlation (r)")
+print(r_mat)
+
+# plot correlations of PCA of sequencing-related variabales against SVs from SVA 
+r_mat = cor(pca_res_seq_pfc$x, sva_res_pfc$meta_data[,sva_res_pfc$sv_names])
+heatmap.2(r_mat,
+          col = blueWhiteRed(50),
+          Rowv = TRUE, 
+          trace = "none",
+          cellnote= round(as.matrix(r_mat),digits = 2), 
+          notecol = "black",
+          notecex=0.9,
+          density.info = "none", 
+          key.xlab ="Correlation (r)")
+print(r_mat)
+    
+
+# HYT 
+# plot correlations of PCA of expression data against PCA of sequencing-related variables 
+r_mat = cor(pca_expr_hyt$x, pca_res_seq_hyt$x)
+heatmap.2(r_mat,
+          col = blueWhiteRed(50),
+          Rowv = TRUE, 
+          trace = "none",
+          cellnote= round(as.matrix(r_mat),digits = 2), 
+          notecol = "black",
+          notecex=0.9,
+          density.info = "none", 
+          key.xlab ="Correlation (r)")
+print(r_mat)
+
+# plot correlations of PCA of expression data against SVs from SVA 
+r_mat = cor(pca_expr_hyt$x, sva_res_hyt$meta_data[,sva_res_hyt$sv_names])
+heatmap.2(r_mat,
+          col = blueWhiteRed(50),
+          Rowv = TRUE, 
+          trace = "none",
+          cellnote= round(as.matrix(r_mat),digits = 2), 
+          notecol = "black",
+          notecex=0.9,
+          density.info = "none", 
+          key.xlab ="Correlation (r)")
+print(r_mat)
+
+# plot correlations of PCA of sequencing-related variabales against SVs from SVA 
+r_mat = cor(pca_res_seq_hyt$x, sva_res_hyt$meta_data[,sva_res_hyt$sv_names])
+heatmap.2(r_mat,
+          col = blueWhiteRed(50),
+          Rowv = TRUE, 
+          trace = "none",
+          cellnote= round(as.matrix(r_mat),digits = 2), 
+          notecol = "black",
+          notecex=0.9,
+          density.info = "none", 
+          key.xlab ="Correlation (r)")
+print(r_mat)
+
+```
+
+## PFC DE modeling
+
+```{r, warning=FALSE, message=FALSE}
+de_res_pfc = runDEmodel(expr_data = v_pfc, meta_data = meta_data_pfc, 
+                        form2use = form4model_pfc,
+                        gene_meta_data = gene_meta_data)
+
+# save tables
+brain_region = "pfc"
+fstem = sprintf("_filt%0.2f",varianceFilterCutoff)
+
+table_names2use = c("Fstat","interaction","group","sex")
+report2screen = sprintf("%s DE genes\n",brain_region)
+for (itable in 1:length(table_names2use)){
+  fname2save = file.path(res_path,
+                         brain_region,
+                         sprintf("DE.%s_table%s.csv",
+                                 table_names2use[itable],
+                                 fstem))
+  tab2use = de_res_pfc[[sprintf("%s_table",table_names2use[itable])]]
+  tab2use = tab2use[order(tab2use$adj.P.Val),]
+  tab2use$DE = "NO"
+  tab2use$DE[tab2use$adj.P.Val<=fdr_qThresh] = "YES"
+  write.csv(tab2use, file = fname2save)
+  if (itable>1){
+    report2screen = c(report2screen, 
+                      sprintf("%s DE genes is %d\n",
+                              table_names2use[itable],
+                              sum(tab2use$adj.P.Val<=fdr_qThresh)))
+  }
+}
+cat(report2screen)
+
+
+# plot percentage of DE genes on each chromosome ------------------------------
+gene_meta_data_sub = subset(gene_meta_data, 
+                            is.element(gene_meta_data$ensembl_gene_id, 
+                                       rownames(exprs_filt_pfc)))
+
+# DE-
+tmp_df = de_res_pfc[["interaction_table"]]
+tmp_df = subset(tmp_df, tmp_df$adj.P.Val<fdr_qThresh & tmp_df$logFC>0)
+chr_res = chromosome_perm(gene_meta_data_sub, 
+                          de_df = tmp_df, 
+                          nperm=10000, 
+                          fdr_qThresh=fdr_qThresh)
+chr_res
+
+fontSize=30
+p = ggplot(data = chr_res, aes(x = reorder(Chromosome,percent), y = percent, fill=-log10(pval))) + 
+  geom_bar(stat="identity") + 
+  scale_fill_gradientn(colors = colorRampPalette(c("grey60","#ff8d1e"))(100), 
+                     limits = c(min(-log10(chr_res$pval)),max(-log10(chr_res$pval)))) +
+  geom_hline(yintercept = min(chr_res[chr_res$fdr<=fdr_qThresh,"percent"])-0.01, linetype="dashed") +
+  xlab("Chromosome") + ylab("Percentage DE genes") +
+  coord_flip() + 
+    theme(
+    axis.text.x = element_text(size=fontSize+10),
+    axis.text.y = element_text(size=fontSize+10),
+    axis.title.x = element_text(size=fontSize+10),
+    strip.text.x = element_text(size=fontSize+10),
+    axis.title.y = element_text(size=fontSize+10))
+ggsave(filename = file.path(plot_path, "DE-.interaction.pfc.chromosomePlot.pdf"),
+       width=18, height=12)
+p
+
+# DE+
+tmp_df = de_res_pfc[["interaction_table"]]
+tmp_df = subset(tmp_df, tmp_df$adj.P.Val<fdr_qThresh & tmp_df$logFC<0)
+chr_res = chromosome_perm(gene_meta_data_sub, 
+                          de_df = tmp_df, 
+                          nperm=10000, 
+                          fdr_qThresh=fdr_qThresh)
+chr_res
+
+fontSize=30
+p = ggplot(data = chr_res, aes(x = reorder(Chromosome,percent), y = percent, fill=-log10(pval))) + 
+  geom_bar(stat="identity") + 
+  scale_fill_gradientn(colors = colorRampPalette(c("grey60","#1e90ff"))(100), 
+                     limits = c(min(-log10(chr_res$pval)),max(-log10(chr_res$pval)))) +
+  geom_hline(yintercept = min(chr_res[chr_res$fdr<=fdr_qThresh,"percent"])-0.01, linetype="dashed") +
+  xlab("Chromosome") + ylab("Percentage DE genes") +
+  coord_flip() + 
+    theme(
+    axis.text.x = element_text(size=fontSize+10),
+    axis.text.y = element_text(size=fontSize+10),
+    axis.title.x = element_text(size=fontSize+10),
+    strip.text.x = element_text(size=fontSize+10),
+    axis.title.y = element_text(size=fontSize+10))
+ggsave(filename = file.path(plot_path, "DE+.interaction.pfc.chromosomePlot.pdf"),width=18, height=12)
+p
+
+
+# make a volcano plot
+
+# interaction volcano plot
+data2use = de_res_pfc[["interaction_table"]]
+fname2save = file.path(plot_path, sprintf("DE.pfc.interaction.volcanoPlot%s.pdf",fstem))
+colors2use = c("#ff8d1e","grey60","#1e90ff")
+p = volcanoPlot(data2use = data2use, 
+                fname2save = fname2save, 
+                fdr_qThresh = fdr_qThresh, 
+                plotTopGenes=FALSE,
+                colors2use=colors2use, 
+                fontSize=40, 
+                dotSize=1, 
+                plotWidth=10, 
+                plotHeight=8)
+p
+
+# sex volcano plot
+data2use = de_res_pfc[["sex_table"]]
+fname2save = file.path(plot_path, sprintf("DE.pfc.sex.volcanoPlot%s.pdf",fstem))
+colors2use = c("#ff8d1e","grey60","#1e90ff")
+p = volcanoPlot(data2use = data2use, 
+                fname2save = fname2save, 
+                fdr_qThresh = fdr_qThresh, 
+                plotTopGenes=TRUE,
+                colors2use=colors2use, 
+                fontSize=40, 
+                dotSize=1, 
+                plotWidth=10, 
+                plotHeight=8)
+p
+
+# group volcano plot
+data2use = de_res_pfc[["group_table"]]
+fname2save = file.path(plot_path, sprintf("DE.pfc.group.volcanoPlot%s.pdf",fstem))
+colors2use = c("grey60","#1e90ff")
+p = volcanoPlot(data2use = data2use, 
+                fname2save = fname2save, 
+                fdr_qThresh = fdr_qThresh, 
+                plotTopGenes=TRUE,
+                colors2use=colors2use, 
+                fontSize=40, 
+                dotSize=1, 
+                plotWidth=10, 
+                plotHeight=8)
+p
+```
+
+## HYT DE modeling
+
+```{r, warning=FALSE, message=FALSE}
+de_res_hyt = runDEmodel(expr_data = v_hyt, meta_data = meta_data_hyt, 
+                        form2use = form4model_hyt,
+                        gene_meta_data = gene_meta_data)
+
+# save tables
+brain_region = "hyt"
+fstem = sprintf("_filt%0.2f",varianceFilterCutoff)
+
+table_names2use = c("Fstat","interaction","group","sex")
+report2screen = sprintf("%s DE genes\n",brain_region)
+for (itable in 1:length(table_names2use)){
+  fname2save = file.path(res_path,
+                         brain_region,
+                         sprintf("DE.%s_table%s.csv",
+                                 table_names2use[itable],
+                                 fstem))
+  tab2use = de_res_hyt[[sprintf("%s_table",table_names2use[itable])]]
+  tab2use = tab2use[order(tab2use$adj.P.Val),]
+  tab2use$DE = "NO"
+  tab2use$DE[tab2use$adj.P.Val<=fdr_qThresh] = "YES"
+  write.csv(tab2use, file = fname2save)
+  if (itable>1){
+    report2screen = c(report2screen, 
+                      sprintf("%s DE genes is %d\n",table_names2use[itable],
+                              sum(tab2use$adj.P.Val<=fdr_qThresh)))
+  }
+}
+cat(report2screen)
+
+# make a volcano plot 
+
+# interaction volcano plot
+data2use = de_res_hyt[["interaction_table"]]
+fname2save = file.path(plot_path, sprintf("DE.hyt.interaction.volcanoPlot%s.pdf",fstem))
+colors2use = "grey60"
+p = volcanoPlot(data2use = data2use, 
+                fname2save = fname2save, 
+                fdr_qThresh = fdr_qThresh, 
+                plotTopGenes=FALSE,
+                colors2use=colors2use, 
+                fontSize=40, 
+                dotSize=1, 
+                plotWidth=10, 
+                plotHeight=8)
+p
+
+# sex volcano plot
+data2use = de_res_hyt[["sex_table"]]
+fname2save = file.path(plot_path, sprintf("DE.hyt.sex.volcanoPlot%s.pdf",fstem))
+colors2use = c("#ff8d1e","grey60","#1e90ff")
+p = volcanoPlot(data2use = data2use, 
+                fname2save = fname2save, 
+                fdr_qThresh = fdr_qThresh, 
+                plotTopGenes=TRUE,
+                colors2use=colors2use, 
+                fontSize=40, 
+                dotSize=1, 
+                plotWidth=10, 
+                plotHeight=8)
+p
+
+# group volcano plot
+data2use = de_res_hyt[["group_table"]]
+fname2save = file.path(plot_path, sprintf("DE.hyt.group.volcanoPlot%s.pdf",fstem))
+colors2use = c("grey60","#1e90ff")
+p = volcanoPlot(data2use = data2use, 
+                fname2save = fname2save, 
+                fdr_qThresh = fdr_qThresh, 
+                plotTopGenes=TRUE,
+                colors2use=colors2use, 
+                fontSize=40, 
+                dotSize=1, 
+                plotWidth=10, 
+                plotHeight=8)
+p
+```
+
+## ASD-related enrichment analyses with DE genes
+
+```{r, warning=FALSE, message=FALSE}
+# pre-allocate array with gene lists to use
+gene_lists2use = c("SFARI", "ptLGD","dup15q DE+", "dup15q DE-",
+                   "ASD DE+","ASD DE-","SCZ DE","BD DE")
+cols2use = c("genelist","OR","pval","fdr")
+gsea_res = data.frame(matrix(nrow = length(gene_lists2use), ncol = length(cols2use)))
+rownames(gsea_res) = gene_lists2use
+colnames(gsea_res) = cols2use
+
+# get DE genes
+mask = de_res_pfc[["interaction_table"]]$adj.P.Val<fdr_qThresh
+de_genes = de_res_pfc[["interaction_table"]]$external_gene_name[mask]
+mask = is.element(hsap_homolog_gene_meta_data$external_gene_name,de_genes)
+de_genes_human_homologs = unique(hsap_homolog_gene_meta_data$hsapiens_homolog_associated_gene_name[is.element(hsap_homolog_gene_meta_data$external_gene_name,de_genes)],incomparables = "")
+de_genes_human_homologs = de_genes_human_homologs[2:length(de_genes_human_homologs)]
+
+# get Pos logFC DE genes - i.e. DE-
+mask = (de_res_pfc[["interaction_table"]]$adj.P.Val<fdr_qThresh & de_res_pfc[["interaction_table"]]$logFC>0)
+pos_de_genes = de_res_pfc[["interaction_table"]]$external_gene_name[mask]
+mask = is.element(hsap_homolog_gene_meta_data$external_gene_name, pos_de_genes)
+pos_de_genes_human_homologs = unique(hsap_homolog_gene_meta_data$hsapiens_homolog_associated_gene_name[is.element(hsap_homolog_gene_meta_data$external_gene_name, pos_de_genes)],incomparables = "")
+pos_de_genes_human_homologs = pos_de_genes_human_homologs[2:length(pos_de_genes_human_homologs)]
+
+# get Neg logFC DE genes - i.e. DE+
+mask = (de_res_pfc[["interaction_table"]]$adj.P.Val<fdr_qThresh & de_res_pfc[["interaction_table"]]$logFC<0)
+neg_de_genes = de_res_pfc[["interaction_table"]]$external_gene_name[mask]
+mask = is.element(hsap_homolog_gene_meta_data$external_gene_name, neg_de_genes)
+neg_de_genes_human_homologs = unique(hsap_homolog_gene_meta_data$hsapiens_homolog_associated_gene_name[is.element(hsap_homolog_gene_meta_data$external_gene_name, neg_de_genes)],incomparables = "")
+neg_de_genes_human_homologs = neg_de_genes_human_homologs[2:length(neg_de_genes_human_homologs)]
+
+# get background list human homologs
+mask = is.element(gene_meta_data$ensembl_gene_id, rownames(exprs_filt_pfc))
+bglist = gene_meta_data$external_gene_name[mask]
+mask = is.element(hsap_homolog_gene_meta_data$external_gene_name,bglist)
+bglist_human_homologs = unique(hsap_homolog_gene_meta_data$hsapiens_homolog_associated_gene_name[is.element(hsap_homolog_gene_meta_data$external_gene_name,bglist)],incomparables = "")
+mask = bglist_human_homologs==""
+bglist_human_homologs = bglist_human_homologs[!mask]
+bg_num = length(bglist)
+
+# load SFARI genes
+sfari_genes = read.csv(file.path(data_path,"SFARI-Gene_genes_01-13-2021release_01-20-2021export.csv"))
+sfari_genes_all = sfari_genes$gene.symbol
+sfari_genes_all = sfari_genes_all[is.element(sfari_genes_all, bglist_human_homologs)]
+
+# load private transmitted LGD genes (Wilfert et al., 2021), doesn't overlap with known DNM and SFARI genes
+ptlgd_genes = read.csv(file.path(data_path,"wilfert2021_supptab17_privateInheritedLGD.csv"))
+ptlgd_genes_all = ptlgd_genes$Gene
+ptlgd_genes_all = ptlgd_genes_all[is.element(ptlgd_genes_all, bglist_human_homologs)]
+
+# load Parikshak 2016 for Dup15q DE genes
+parikshak2016 = read.csv(file.path(data_path,"parikshak2016_degenes.csv"))
+mask = parikshak2016$FDR.adjusted.P.value..dup15q.vs.CTL<=0.05
+de_dup15q_genes = parikshak2016$HGNC.Symbol[mask]
+mask = de_dup15q_genes==""
+de_dup15q_genes = de_dup15q_genes[!mask]
+de_dup15q_genes = de_dup15q_genes[is.element(de_dup15q_genes, bglist_human_homologs)]
+
+# upregulated in dup15q
+mask = (parikshak2016$FDR.adjusted.P.value..dup15q.vs.CTL<=0.05) & (parikshak2016$log2.FC..dup15q.vs.CTL>0)
+de_dup15q_genes = parikshak2016$HGNC.Symbol[mask]
+mask = de_dup15q_genes==""
+de_dup15q_UP_genes = de_dup15q_genes[!mask]
+de_dup15q_UP_genes = de_dup15q_UP_genes[is.element(de_dup15q_UP_genes, bglist_human_homologs)]
+
+# downregulated in dup15q
+mask = (parikshak2016$FDR.adjusted.P.value..dup15q.vs.CTL<=0.05) & (parikshak2016$log2.FC..dup15q.vs.CTL<0)
+de_dup15q_genes = parikshak2016$HGNC.Symbol[mask]
+mask = de_dup15q_genes==""
+de_dup15q_DOWN_genes = de_dup15q_genes[!mask]
+de_dup15q_DOWN_genes = de_dup15q_DOWN_genes[is.element(de_dup15q_DOWN_genes, bglist_human_homologs)]
+
+# load Gandal 2018 for ASD, SCZ, and BD DE genes
+# ASD 
+gandal2018 = read.csv(file.path(data_path,"gandal2018_degenes.csv"))
+mask = gandal2018$ASD.fdr<=0.05
+de_asd_genes = gandal2018$gene_name[mask]
+mask = de_asd_genes==""
+de_asd_genes = de_asd_genes[!mask]
+de_asd_genes = de_asd_genes[is.element(de_asd_genes, bglist_human_homologs)]
+
+# upregulated
+mask = (gandal2018$ASD.fdr<=0.05) & (gandal2018$ASD.log2FC>0)
+de_asd_genes = gandal2018$gene_name[mask]
+mask = de_asd_genes==""
+de_asd_UP_genes = de_asd_genes[!mask]
+de_asd_UP_genes = de_asd_UP_genes[is.element(de_asd_UP_genes, bglist_human_homologs)]
+
+# downregulated
+mask = (gandal2018$ASD.fdr<=0.05) & (gandal2018$ASD.log2FC<0)
+de_asd_genes = gandal2018$gene_name[mask]
+mask = de_asd_genes==""
+de_asd_DOWN_genes = de_asd_genes[!mask]
+de_asd_DOWN_genes = de_asd_DOWN_genes[is.element(de_asd_DOWN_genes, bglist_human_homologs)]
+
+# Schizophrenia 
+mask = gandal2018$SCZ.fdr<=0.05
+de_scz_genes = gandal2018$gene_name[mask]
+mask = de_scz_genes==""
+de_scz_genes = de_scz_genes[!mask]
+de_scz_genes = de_scz_genes[is.element(de_scz_genes, bglist_human_homologs)]
+
+# Bipolar
+mask = gandal2018$BD.fdr<=0.05
+de_bd_genes = gandal2018$gene_name[mask]
+mask = de_bd_genes==""
+de_bd_genes = de_bd_genes[!mask]
+de_bd_genes = de_bd_genes[is.element(de_bd_genes, bglist_human_homologs)]
+
+
+gene_lists4loop = list(sfari_genes_all, 
+                       ptlgd_genes_all,
+                       de_dup15q_UP_genes, de_dup15q_DOWN_genes,
+                       de_asd_UP_genes, de_asd_DOWN_genes, 
+                       de_scz_genes,
+                       de_bd_genes)
+
+# All DE genes
+for (ilist in 1:length(gene_lists4loop)){
+  list1 = de_genes_human_homologs
+  list2 = gene_lists4loop[[ilist]]
+  list2 = list2[is.element(list2,bglist_human_homologs)]
+  backgroundTotal = bg_num
+  overlap_res = genelistOverlap(list1 = list1, list2 = list2,
+                                backgroundTotal = bg_num, print_result = FALSE) 
+  if (ilist==1){
+    sfari_overlap = overlap_res[[1]]$overlapping_genes
+    sfari_genes_de_overlap  = sfari_genes[is.element(sfari_genes$gene.symbol,sfari_overlap),]
+    write.csv(sfari_genes_de_overlap, file = file.path(res_path, "pfc", "sfari_de_overlap.csv"))
+    print(gene_lists2use[ilist])
+    print(overlap_res[[1]]$percent_overlap_list2)
+    print(length(overlap_res[[1]]$overlapping_genes))
+    print(overlap_res[[1]]$overlapping_genes)
+  } else if (ilist==2){
+    ptlgd_overlap = overlap_res[[1]]$overlapping_genes
+    ptlgd_genes_de_overlap  = ptlgd_genes[is.element(ptlgd_genes$Gene,ptlgd_overlap),]
+    write.csv(ptlgd_genes_de_overlap, file = file.path(res_path, "pfc","ptlgd_de_overlap.csv"))
+    print(gene_lists2use[ilist])
+    print(overlap_res[[1]]$percent_overlap_list2)
+    print(length(overlap_res[[1]]$overlapping_genes))
+    print(overlap_res[[1]]$overlapping_genes)
+    
+  }
+  gsea_res[gene_lists2use[ilist],"genelist"] = gene_lists2use[ilist]
+  gsea_res[gene_lists2use[ilist],"OR"] = overlap_res[[1]]$OR
+  gsea_res[gene_lists2use[ilist],"pval"] = overlap_res[[1]]$hypergeo_p
+}
+gsea_res[,"fdr"] = p.adjust(gsea_res[,"pval"], method = "fdr")
+gsea_res
+
+p = ggplot(data = gsea_res, aes(x = reorder(genelist, OR), y = -log10(pval), fill = OR)) + 
+  geom_bar(stat = "identity") + 
+  ylab("-log10(p)") + 
+  xlab(" ") + 
+  geom_hline(yintercept = -log10(0.03), linetype="dashed") +
+  scale_fill_gradientn(colors = colorRampPalette(c("white","red"))(100), 
+                       limits = c(1,max(gsea_res$OR))) +
+  coord_flip()
+ggsave(filename = file.path(plot_path, sprintf("DE.interaction.pfc.humanEnrichments%s.pdf",fstem)))
+p
+
+
+# Pos logFC - i.e. DE-
+for (ilist in 1:length(gene_lists4loop)){
+  list1 = pos_de_genes_human_homologs
+  list2 = gene_lists4loop[[ilist]]
+  list2 = list2[is.element(list2,bglist_human_homologs)]
+  backgroundTotal = bg_num
+  overlap_res = genelistOverlap(list1 = list1, list2 = list2,
+                                backgroundTotal = bg_num, print_result = FALSE) 
+  if (ilist==1){
+    print(gene_lists2use[ilist])
+    print(overlap_res[[1]]$percent_overlap_list2)
+    print(length(overlap_res[[1]]$overlapping_genes))
+    print(overlap_res[[1]]$overlapping_genes)
+  }
+
+  gsea_res[gene_lists2use[ilist],"genelist"] = gene_lists2use[ilist]
+  gsea_res[gene_lists2use[ilist],"OR"] = overlap_res[[1]]$OR
+  gsea_res[gene_lists2use[ilist],"pval"] = overlap_res[[1]]$hypergeo_p
+}
+gsea_res[,"fdr"] = p.adjust(gsea_res[,"pval"], method = "fdr")
+poslogfc_res = gsea_res
+gsea_res
+
+p = ggplot(data = gsea_res, aes(x = reorder(genelist, OR), y = -log10(pval), fill = OR)) + 
+  geom_bar(stat = "identity") + 
+  ylab("-log10(p)") + 
+  xlab(" ") + 
+  geom_hline(yintercept = -log10(0.03), linetype="dashed") +
+  scale_fill_gradientn(colors = colorRampPalette(c("white","red"))(100), 
+                       limits = c(1,max(gsea_res$OR))) +
+  coord_flip()
+ggsave(filename = file.path(plot_path, sprintf("DE.interaction.pfc.PosLogFC.humanEnrichments%s.pdf",fstem)))
+p
+
+# Neg logFC - i.e. DE+
+for (ilist in 1:length(gene_lists4loop)){
+  list1 = neg_de_genes_human_homologs
+  list2 = gene_lists4loop[[ilist]]
+  list2 = list2[is.element(list2,bglist_human_homologs)]
+  backgroundTotal = bg_num
+  overlap_res = genelistOverlap(list1 = list1, list2 = list2,
+                                backgroundTotal = bg_num, print_result = FALSE) 
+  
+  gsea_res[gene_lists2use[ilist],"genelist"] = gene_lists2use[ilist]
+  gsea_res[gene_lists2use[ilist],"OR"] = overlap_res[[1]]$OR
+  gsea_res[gene_lists2use[ilist],"pval"] = overlap_res[[1]]$hypergeo_p
+}
+gsea_res[,"fdr"] = p.adjust(gsea_res[,"pval"], method = "fdr")
+neglogfc_res = gsea_res
+gsea_res
+
+p = ggplot(data = gsea_res, aes(x = reorder(genelist, OR), y = -log10(pval), fill = OR)) + 
+  geom_bar(stat = "identity") + 
+  ylab("-log10(p)") + 
+  xlab(" ") + 
+  geom_hline(yintercept = -log10(0.03), linetype="dashed") +
+  scale_fill_gradientn(colors = colorRampPalette(c("white","red"))(100), 
+                       limits = c(1,max(gsea_res$OR))) +
+  coord_flip()
+ggsave(filename = file.path(plot_path, sprintf("DE.interaction.pfc.NegLogFC.humanEnrichments%s.pdf",fstem)))
+p
+```
+
+## Sex hormone-related enrichment analyses with DE genes
+
+```{r, warning=FALSE, message=FALSE}
+# pre-allocate array with gene lists to use
+gene_lists2use = c("DHT DE+","DHT DE-","EST DE+","EST DE-",
+                   "AR Targets","ER Targets","Male DT","Female DT","SexDiv DT")
+cols2use = c("genelist","OR","pval","fdr")
+gsea_res = data.frame(matrix(nrow = length(gene_lists2use), ncol = length(cols2use)))
+rownames(gsea_res) = gene_lists2use
+colnames(gsea_res) = cols2use
+
+# get DE genes
+mask = de_res_pfc[["interaction_table"]]$adj.P.Val<fdr_qThresh
+de_genes = de_res_pfc[["interaction_table"]]$external_gene_name[mask]
+mask = is.element(hsap_homolog_gene_meta_data$external_gene_name,de_genes)
+de_genes_human_homologs = unique(hsap_homolog_gene_meta_data$hsapiens_homolog_associated_gene_name[is.element(hsap_homolog_gene_meta_data$external_gene_name,de_genes)],incomparables = "")
+de_genes_human_homologs = de_genes_human_homologs[2:length(de_genes_human_homologs)]
+
+# get Pos logFC DE genes - i.e. DE-
+mask = (de_res_pfc[["interaction_table"]]$adj.P.Val<fdr_qThresh & de_res_pfc[["interaction_table"]]$logFC>0)
+pos_de_genes = de_res_pfc[["interaction_table"]]$external_gene_name[mask]
+mask = is.element(hsap_homolog_gene_meta_data$external_gene_name, pos_de_genes)
+pos_de_genes_human_homologs = unique(hsap_homolog_gene_meta_data$hsapiens_homolog_associated_gene_name[is.element(hsap_homolog_gene_meta_data$external_gene_name, pos_de_genes)],incomparables = "")
+pos_de_genes_human_homologs = pos_de_genes_human_homologs[2:length(pos_de_genes_human_homologs)]
+
+# get Neg logFC DE genes - i.e. DE+
+mask = (de_res_pfc[["interaction_table"]]$adj.P.Val<fdr_qThresh & de_res_pfc[["interaction_table"]]$logFC<0)
+neg_de_genes = de_res_pfc[["interaction_table"]]$external_gene_name[mask]
+mask = is.element(hsap_homolog_gene_meta_data$external_gene_name, neg_de_genes)
+neg_de_genes_human_homologs = unique(hsap_homolog_gene_meta_data$hsapiens_homolog_associated_gene_name[is.element(hsap_homolog_gene_meta_data$external_gene_name, neg_de_genes)],incomparables = "")
+neg_de_genes_human_homologs = neg_de_genes_human_homologs[2:length(neg_de_genes_human_homologs)]
+
+# get background list human homologs
+mask = is.element(gene_meta_data$ensembl_gene_id, rownames(exprs_filt_pfc))
+bglist = gene_meta_data$external_gene_name[mask]
+mask = is.element(hsap_homolog_gene_meta_data$external_gene_name,bglist)
+bglist_human_homologs = unique(hsap_homolog_gene_meta_data$hsapiens_homolog_associated_gene_name[is.element(hsap_homolog_gene_meta_data$external_gene_name,bglist)],incomparables = "")
+mask = bglist_human_homologs==""
+bglist_human_homologs = bglist_human_homologs[!mask]
+bg_num = length(bglist)
+
+# load DHT genes 
+dht_genes = read.csv(file.path(data_path,"lombardo_2020_degenes_DHT_hNSC.csv"))
+dht_genes_all = dht_genes$GeneSymbol
+dht_genes_all = dht_genes_all[is.element(dht_genes_all, bglist_human_homologs)]
+
+# upregulated
+dht_genes_UP = dht_genes$GeneSymbol[dht_genes$direction=="upreg"]
+dht_genes_UP = dht_genes_UP[is.element(dht_genes_UP, bglist_human_homologs)]
+
+# downregulated
+dht_genes_DOWN = dht_genes$GeneSymbol[dht_genes$direction=="downreg"]
+dht_genes_DOWN = dht_genes_DOWN[is.element(dht_genes_DOWN, bglist_human_homologs)]
+
+# load EST genes 
+est_genes = read.csv(file.path(data_path,"csoregh_2009_EST_DE.csv"))
+est_genes_all = est_genes$GeneSymbol
+est_genes_all = unique(est_genes_all[!is.na(est_genes_all)])
+est_genes_all = est_genes_all[is.element(est_genes_all, bglist_human_homologs)]
+
+# upregulated
+est_genes_UP = est_genes$GeneSymbol[est_genes$direction=="up"]
+est_genes_UP = unique(est_genes_UP[!is.na(est_genes_UP)])
+est_genes_UP = est_genes_UP[is.element(est_genes_UP, bglist_human_homologs)]
+
+# dowrnegulated
+est_genes_DOWN = est_genes$GeneSymbol[est_genes$direction=="down"]
+est_genes_DOWN = unique(est_genes_DOWN[!is.na(est_genes_DOWN)])
+est_genes_DOWN = est_genes_UP[is.element(est_genes_DOWN, bglist_human_homologs)]
+
+
+# load AR-target genes
+artarg_genes = read.csv(file.path(data_path,"quartier_2019_ARtargetGenes_ChIPSeq_hNSC.csv"))
+artarg_genes_all = artarg_genes$GeneSymbol
+artarg_genes_all = artarg_genes_all[is.element(artarg_genes_all, bglist_human_homologs)]
+
+# load ER-alpha target genes
+ertarg_genes = read_excel(file.path(data_path,"gegenhuber_Data_S1_ERa_peaks_final.xlsx"), sheet = "Brain-specific peaks")
+ertarg_genes = data.frame(ertarg_genes)
+ertarg_genes_all = as.character(ertarg_genes[,"Gene.annotation"])
+mask = is.element(hsap_homolog_gene_meta_data$external_gene_name, ertarg_genes_all)
+ertarg_genes_human_homologs = unique(hsap_homolog_gene_meta_data$hsapiens_homolog_associated_gene_name[mask],incomparables = "")
+ertarg_genes_all = ertarg_genes_human_homologs[!ertarg_genes_human_homologs==""]
+ertarg_genes_all = ertarg_genes_all[is.element(ertarg_genes_all, bglist_human_homologs)]
+
+
+# load sex differentially targeted genes
+male_dt_genes = read.csv(file.path(data_path,"lopes-ramos_2020_DTgenes.csv"))
+male_dt_genes = male_dt_genes$GeneSymbol[male_dt_genes$DTclass=="Male-biased"]  
+male_dt_genes = male_dt_genes[is.element(male_dt_genes, bglist_human_homologs)]
+
+female_dt_genes = read.csv(file.path(data_path,"lopes-ramos_2020_DTgenes.csv"))
+female_dt_genes = female_dt_genes$GeneSymbol[female_dt_genes$DTclass=="Female-biased"]  
+female_dt_genes = female_dt_genes[is.element(female_dt_genes, bglist_human_homologs)]
+
+sexdiv_dt_genes = read.csv(file.path(data_path,"lopes-ramos_2020_DTgenes.csv"))
+sexdiv_dt_genes = sexdiv_dt_genes$GeneSymbol[sexdiv_dt_genes$DTclass=="Sex-divergent"]  
+sexdiv_dt_genes = sexdiv_dt_genes[is.element(sexdiv_dt_genes, bglist_human_homologs)]
+
+
+gene_lists4loop = list(dht_genes_UP, dht_genes_DOWN, 
+                       est_genes_UP, est_genes_DOWN, 
+                       artarg_genes_all,
+                       ertarg_genes_all,
+                       male_dt_genes,
+                       female_dt_genes,
+                       sexdiv_dt_genes)
+
+brain_region = "pfc"
+
+# Pos logFC - i.e. DE-
+for (ilist in 1:length(gene_lists4loop)){
+  list1 = pos_de_genes_human_homologs
+  list2 = gene_lists4loop[[ilist]]
+  list2 = list2[is.element(list2,bglist_human_homologs)]
+  backgroundTotal = bg_num
+  overlap_res = genelistOverlap(list1 = list1, list2 = list2,
+                                backgroundTotal = bg_num, print_result = FALSE) 
+
+  gsea_res[gene_lists2use[ilist],"genelist"] = gene_lists2use[ilist]
+  gsea_res[gene_lists2use[ilist],"OR"] = overlap_res[[1]]$OR
+  gsea_res[gene_lists2use[ilist],"pval"] = overlap_res[[1]]$hypergeo_p
+}
+gsea_res[,"fdr"] = p.adjust(gsea_res[,"pval"], method = "fdr")
+poslogfc_sexhormone_res = gsea_res
+gsea_res
+
+p = ggplot(data = gsea_res, aes(x = reorder(genelist, OR), y = -log10(pval), fill = OR)) + 
+  geom_bar(stat = "identity") + 
+  ylab("-log10(p)") + 
+  xlab(" ") + 
+  geom_hline(yintercept = -log10(0.03), linetype="dashed") +
+  scale_fill_gradientn(colors = colorRampPalette(c("white","red"))(100), 
+                       limits = c(1,max(gsea_res$OR))) +
+  coord_flip()
+ggsave(filename = file.path(plot_path, sprintf("DE.interaction.pfc.PosLogFC.SexHormoneEnrichments%s.pdf",fstem)))
+p
+
+# Neg logFC - i.e. DE+
+for (ilist in 1:length(gene_lists4loop)){
+  list1 = neg_de_genes_human_homologs
+  list2 = gene_lists4loop[[ilist]]
+  list2 = list2[is.element(list2,bglist_human_homologs)]
+  backgroundTotal = bg_num
+  overlap_res = genelistOverlap(list1 = list1, list2 = list2,
+                                backgroundTotal = bg_num, print_result = FALSE) 
+
+  gsea_res[gene_lists2use[ilist],"genelist"] = gene_lists2use[ilist]
+  gsea_res[gene_lists2use[ilist],"OR"] = overlap_res[[1]]$OR
+  gsea_res[gene_lists2use[ilist],"pval"] = overlap_res[[1]]$hypergeo_p
+}
+gsea_res[,"fdr"] = p.adjust(gsea_res[,"pval"], method = "fdr")
+neglogfc_sexhormone_res = gsea_res
+gsea_res
+
+p = ggplot(data = gsea_res, aes(x = reorder(genelist, OR), y = -log10(pval), fill = OR)) + 
+  geom_bar(stat = "identity") + 
+  ylab("-log10(p)") + 
+  xlab(" ") + 
+  geom_hline(yintercept = -log10(0.03), linetype="dashed") +
+  scale_fill_gradientn(colors = colorRampPalette(c("white","red"))(100), 
+                       limits = c(1,max(gsea_res$OR))) +
+  coord_flip()
+ggsave(filename = file.path(plot_path, sprintf("DE.interaction.pfc.NegLogFC.SexHormoneEnrichments%s.pdf",fstem)))
+p
+```
+
+## Plot enrichments as heatmap
+
+```{r, warning=FALSE, message=FALSE}
+poslogfc_res$type = "DE-"
+neglogfc_res$type = "DE+"
+poslogfc_sexhormone_res$type = "DE-"
+neglogfc_sexhormone_res$type = "DE+"
+
+df_gsea = rbind(poslogfc_res, neglogfc_res, poslogfc_sexhormone_res, neglogfc_sexhormone_res)
+df_gsea$genelist = factor(df_gsea$genelist, 
+                          levels = rev(c("dup15q DE+","dup15q DE-", 
+                                         "SFARI", "ptLGD",
+                                         "ASD DE+","ASD DE-",
+                                         "SCZ DE","BD DE",
+                                         "DHT DE+","DHT DE-",
+                                         "EST DE+","EST DE-",
+                                         "AR Targets","ER Targets",
+                                         "Male DT","Female DT","SexDiv DT")))
+df_gsea
+
+fontSize = 5
+p = ggplot(data = df_gsea) + 
+  geom_tile(aes(y = genelist, x = type, fill= -log10(pval))) + 
+  geom_text(aes(y=genelist, x=type,label = round(OR,2)), size = fontSize) + 
+  scale_fill_gradient(low = "white", high="red") + ylab("")+xlab("") +
+  theme(
+    # Remove panel border
+    panel.border = element_blank(),  
+    # Remove panel grid lines
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    # Remove panel background
+    panel.background = element_blank(),
+    axis.text.x = element_text(size=fontSize),
+    axis.text.y = element_text(size=fontSize+10),
+    axis.title.x = element_text(size=fontSize),
+    strip.text.x = element_text(size=fontSize),
+    axis.title.y = element_text(size=fontSize))
+  
+ggsave(filename = file.path(plot_path, sprintf("DE.interaction.pfc.EnrichmentHeatmap%s.pdf",fstem)),width = 5, height=5)
+p
+```
+
+## Plot specific genes of interest 
+
+```{r, warning=FALSE, message=FALSE}
+PLOT = FALSE
+if (PLOT){
+  dotSize = 10
+  fontSize = 40
+  # get DE genes
+  mask = de_res_pfc[["interaction_table"]]$adj.P.Val<fdr_qThresh
+  genes2plot = de_res_pfc[["interaction_table"]]$ensembl_id[mask]
+  gene_names = de_res_pfc[["interaction_table"]]$external_gene_name[mask]
+  
+  mask = is.element(hsap_homolog_gene_meta_data$hsapiens_homolog_ensembl_gene, sfari_genes_de_overlap$ensembl.id)
+  gene_names2print = hsap_homolog_gene_meta_data$external_gene_name[mask]
+  
+  for (igene in 1:length(genes2plot)){
+    gene2plot = genes2plot[igene]
+    gene_name = gene_names[igene]
+    
+    exprdata2plot = subset(v_pfc$E,is.element(rownames(v_pfc$E),gene2plot))
+    data2plot = data.frame(meta_data_pfc, expr_data = t(exprdata2plot))
+    colnames(data2plot)[dim(data2plot)[2]] = "expr_data"
+    
+    p = ggplot(data = data2plot, aes(x = group, y = expr_data, colour = sex)) + facet_grid(. ~ sex)
+    p = p + geom_jitter(size = dotSize) + geom_boxplot(fill = NA, colour = "#000000", outlier.shape = NA)
+    p = p + ylab("log(CPM)") + xlab("") + ggtitle(gene_name) +  
+        theme(axis.text.x = element_text(size=fontSize),
+        axis.text.y = element_text(size=fontSize),
+        axis.title.x = element_text(size=fontSize),
+        strip.text.x = element_text(size=fontSize),
+        axis.title.y = element_text(size=fontSize),
+        plot.title = element_text(hjust = 0.5, size=fontSize))
+
+    ggsave(filename = file.path(plot_path, sprintf("%s.pdf",gene_name)), width=10,height=8)
+    
+  }
+}
+```
+
+## Enrichment analysis with Allen cell types 
+
+```{r, warning=FALSE, message=FALSE}
+plotWidth = 10
+plotHeight = 7
+
+# specify which databases to query
+dbs = c("Allen_Brain_Atlas_10x_scRNA_2021")
+dbs_names = c("Allen10x_scRNA_2021")
+
+topNterms = 25
+brain_region = "pfc"
+de_genes2use = de_res_pfc[["interaction_table"]]$external_gene_name[de_res_pfc[["interaction_table"]]$adj.P.Val<=fdr_qThresh]
+mask = de_res_pfc[["interaction_table"]]$adj.P.Val<=fdr_qThresh & de_res_pfc[["interaction_table"]]$logFC>0
+de_genes2use1 = de_res_pfc[["interaction_table"]]$external_gene_name[mask]
+mask = de_res_pfc[["interaction_table"]]$adj.P.Val<=fdr_qThresh & de_res_pfc[["interaction_table"]]$logFC<0
+de_genes2use2 = de_res_pfc[["interaction_table"]]$external_gene_name[mask]
+
+if (!is_empty(de_genes2use)){
+  enrichment_res = enrichr(de_genes2use, dbs)
+  enrichment_res1 = enrichr(de_genes2use1, dbs)
+  enrichment_res2 = enrichr(de_genes2use2, dbs)
+  
+  for (idb in 1:length(dbs_names)){
+    
+    # all DE genes
+    go_res = enrichment_res[[dbs[idb]]]
+    write.csv(go_res, file = file.path(res_path,
+                                       brain_region,
+                                       sprintf("DE.interaction.%s%s.csv",
+                                               dbs_names[idb],
+                                               fstem)))
+    data4plot = go_res[go_res$Adjusted.P.value<=fdr_qThresh,1:(ncol(go_res)-1)]
+    data4plot = data4plot[1:topNterms,]
+    p = ggplot(data = data4plot, 
+               aes(x = reorder(Term, -log10(P.value)), 
+                   y = -log10(P.value), 
+                   fill = -log10(P.value))) +
+      geom_bar(stat = "identity") + 
+      ylab("-log10(p)") + 
+      xlab(" ") + 
+      geom_hline(yintercept = -log10(0.05), linetype="dashed") +
+      scale_fill_gradientn(colors = colorRampPalette(c("white","red"))(100),
+                           limits = c(-log10(0.05),max(-log10(data4plot$P.value)))) +
+      coord_flip()
+    ggsave(filename = file.path(plot_path,
+                                sprintf("DE.interaction.%s.%s%s.pdf",
+                                        brain_region,
+                                        dbs_names[idb],
+                                        fstem)),
+           width = plotWidth, height = plotHeight)
+
+    # DE-
+    go_res = enrichment_res1[[dbs[idb]]]
+    write.csv(go_res, file = file.path(res_path,
+                                       brain_region,
+                                       sprintf("DE.interaction.%s.PosLogFC%s.csv",
+                                               dbs_names[idb],
+                                               fstem)))
+    data4plot = go_res[go_res$Adjusted.P.value<=fdr_qThresh,1:(ncol(go_res)-1)]
+    data4plot = data4plot[1:topNterms,]
+    p = ggplot(data = data4plot, aes(x = reorder(Term, -log10(P.value)), y = -log10(P.value), fill = -log10(P.value))) + 
+      geom_bar(stat = "identity") + 
+      ylab("-log10(p)") + 
+      xlab(" ") + 
+      geom_hline(yintercept = -log10(0.05), linetype="dashed") +
+      scale_fill_gradientn(colors = colorRampPalette(c("white","red"))(100),
+                           limits = c(-log10(0.05),max(-log10(data4plot$P.value)))) +
+      coord_flip()
+    ggsave(filename = file.path(plot_path,
+                                sprintf("DE.interaction.%s.%s.PosLogFC%s.pdf",
+                                        brain_region,
+                                        dbs_names[idb],
+                                        fstem)),
+           width = plotWidth, height = plotHeight)
+
+    # DE+
+    go_res = enrichment_res2[[dbs[idb]]]
+    write.csv(go_res, file = file.path(res_path,
+                                       brain_region,
+                                       sprintf("DE.interaction.%s.NegLogFC%s.csv",
+                                               dbs_names[idb],
+                                               fstem)))
+    data4plot = go_res[go_res$Adjusted.P.value<=fdr_qThresh,1:(ncol(go_res)-1)]
+    data4plot = data4plot[1:topNterms,]
+    p = ggplot(data = data4plot, aes(x = reorder(Term, -log10(P.value)), 
+                                     y = -log10(P.value), 
+                                     fill = -log10(P.value))) +
+      geom_bar(stat = "identity") + 
+      ylab("-log10(p)") + 
+      xlab(" ") + 
+      geom_hline(yintercept = -log10(0.05), linetype="dashed") +
+      scale_fill_gradientn(colors = colorRampPalette(c("white","red"))(100),
+                           limits = c(-log10(0.05),max(-log10(data4plot$P.value)))) +
+      coord_flip()
+    ggsave(filename = file.path(plot_path,
+                                sprintf("DE.interaction.%s.%s.NegLogFC%s.pdf",
+                                        brain_region,
+                                        dbs_names[idb],
+                                        fstem)),
+           width = plotWidth, height = plotHeight)
+    
+  } # for (idb in 1:length(dbs_names)){
+
+} # if (!is_empty(de_genes2use)){
+
+```
+
+## Annotate Allen cell type enrichments
+
+```{r, warning=FALSE, message=FALSE}
+brain_region = "pfc"
+fnames2loop  = c("DE.interaction.Allen10x_scRNA_2021","DE.interaction.Allen10x_scRNA_2021.NegLogFC",
+                 "DE.interaction.Allen10x_scRNA_2021.PosLogFC")
+
+for (i in 1:length(fnames2loop)){
+  celltype_data = read.csv(file.path(res_path, brain_region,sprintf("%s_filt0.15.csv",fnames2loop[i])))
+  celltype_data = annotate_celltypes(celltype_data)
+  celltype_data = subset(celltype_data, celltype_data$Adjusted.P.value<=fdr_qThresh)
+  celltype_data = celltype_data[order(celltype_data$class, decreasing = FALSE),]
+
+  write.csv(celltype_data, file = file.path(res_path, brain_region,sprintf("%s_FINAL_filt0.15.csv",fnames2loop[i])))
+}# for (i in 1:length(fnames2loop)){
+
+# -----------------------------------------------------------------------------
+# plot DE neg and pos log FC direction in one plot
+i=2
+celltype_data = read.csv(file.path(res_path, brain_region,sprintf("%s_filt0.15.csv",fnames2loop[i])))
+celltype_data = annotate_celltypes(celltype_data)
+de_neg_celltypes = subset(celltype_data, celltype_data$Adjusted.P.value<=fdr_qThresh)
+de_neg_celltypes$direction = "DE+" #"Neg log2(FC)"
+
+i=3
+celltype_data = read.csv(file.path(res_path, brain_region,sprintf("%s_filt0.15.csv",fnames2loop[i])))
+celltype_data = annotate_celltypes(celltype_data)
+de_pos_celltypes = subset(celltype_data, celltype_data$Adjusted.P.value<=fdr_qThresh)
+de_pos_celltypes$direction = "DE-" # "Pos log2(FC)"
+
+de_celltypes = rbind(de_pos_celltypes, de_neg_celltypes)
+de_celltypes$direction = factor(de_celltypes$direction, levels = c("DE+","DE-"))
+
+# get non-duplicated cluster IDs and final_label2
+tmp = de_celltypes[,c("cluster_id","final_label2","class_label","plotcolor2use")]
+tmp = tmp[!duplicated(tmp),]
+tmp = tmp[order(tmp$cluster_id),]
+tmp$cluster_id = factor(tmp$cluster_id)
+tmp$final_label2 = factor(tmp$final_label2)
+tmp$plotcolor2use = factor(tmp$plotcolor2use)
+tmp$class_label = factor(tmp$class_label)
+tmp = tmp %>% mutate(
+  name = glue("<b style='color:{plotcolor2use}'>{final_label2}</b>"),
+  name = fct_reorder(name, -as.numeric(cluster_id))
+)
+
+# turn cluster id into a factor and then reverse the ordering of the levels
+de_celltypes$cluster_id = factor(de_celltypes$cluster_id)
+de_celltypes$cluster_id = fct_rev(de_celltypes$cluster_id)
+
+df2plot = merge(de_celltypes, tmp[,c("final_label2","name")], by = "final_label2")
+
+p = ggplot(data = df2plot, aes(x = name, y = -log10(P.value), fill=class_label)) +
+  facet_grid(. ~ direction) +
+  geom_bar(stat = "identity") +
+  # scale_x_discrete(limits = rev(levels(tmp$cluster_id)), labels = rev(tmp$final_label2)) +
+  xlab("Cell Types") + ylab("-log10(p)") + coord_flip() +  ggtitle(" ") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.y = element_markdown())
+ggsave(filename = file.path(plot_path, "DE.celltypes.pdf"), height=12, width = 12)
+p
+
+
+p = ggplot(data = df2plot, aes(x = direction, y = name), fill = class_label) +
+  geom_tile(aes(x = direction, y = name, fill= -log10(P.value))) +
+  geom_text(aes(x = direction, y = name, label = round(Odds.Ratio,2))) +
+  scale_fill_gradient(low = "white", high="red") + ylab("")+xlab("") +
+  theme(
+    # Remove panel border
+    panel.border = element_blank(),
+    # Remove panel grid lines
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    # Remove panel background
+    panel.background = element_blank(),
+    axis.text.y = element_markdown())
+ggsave(filename = file.path(plot_path, "DE.celltypes.Heatmap.pdf"), width=6, height=12)
+p
+
+```
