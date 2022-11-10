@@ -535,6 +535,7 @@ p
 ```{r, warning=FALSE, message=FALSE}
 # pre-allocate array with gene lists to use
 gene_lists2use = c("SFARI", "ptLGD","dup15q DE+", "dup15q DE-",
+                   "AS iPSC","dup15q iPSC",
                    "ASD DE+","ASD DE-","SCZ DE","BD DE")
 cols2use = c("genelist","OR","pval","fdr")
 gsea_res = data.frame(matrix(nrow = length(gene_lists2use), ncol = length(cols2use)))
@@ -603,6 +604,23 @@ mask = de_dup15q_genes==""
 de_dup15q_DOWN_genes = de_dup15q_genes[!mask]
 de_dup15q_DOWN_genes = de_dup15q_DOWN_genes[is.element(de_dup15q_DOWN_genes, bglist_human_homologs)]
 
+
+# load Germain 2014 for AS and dup15q iPSC DE genes
+germain2014 = read.csv(file.path(data_path,"germain_2014_15qCNV_iPSC_rnaseq_data.csv"))
+
+mask = germain2014$FoldChange_AS>=2 | germain2014$FoldChange_AS<=0.5 
+as_ipsc_deall_genes = unique(germain2014$gene_name[mask]) 
+mask = as_ipsc_deall_genes==""
+as_ipsc_deall_genes = as_ipsc_deall_genes[!mask]
+as_ipsc_deall_genes = as_ipsc_deall_genes[is.element(as_ipsc_deall_genes, bglist_human_homologs)]
+
+mask = germain2014$FoldChange_dupl>=2 | germain2014$FoldChange_dupl<=0.5 
+dup15q_ipsc_deall_genes = unique(germain2014$gene_name[mask])
+mask = dup15q_ipsc_deall_genes==""
+dup15q_ipsc_deall_genes = dup15q_ipsc_deall_genes[!mask]
+dup15q_ipsc_deall_genes = dup15q_ipsc_deall_genes[is.element(dup15q_ipsc_deall_genes, bglist_human_homologs)]
+
+
 # load Gandal 2018 for ASD, SCZ, and BD DE genes
 # ASD 
 gandal2018 = read.csv(file.path(data_path,"gandal2018_degenes.csv"))
@@ -644,6 +662,7 @@ de_bd_genes = de_bd_genes[is.element(de_bd_genes, bglist_human_homologs)]
 gene_lists4loop = list(sfari_genes_all, 
                        ptlgd_genes_all,
                        de_dup15q_UP_genes, de_dup15q_DOWN_genes,
+                       as_ipsc_deall_genes, dup15q_ipsc_deall_genes,
                        de_asd_UP_genes, de_asd_DOWN_genes, 
                        de_scz_genes,
                        de_bd_genes)
@@ -681,7 +700,8 @@ for (ilist in 1:length(gene_lists4loop)){
 gsea_res[,"fdr"] = p.adjust(gsea_res[,"pval"], method = "fdr")
 gsea_res
 
-p = ggplot(data = gsea_res, aes(x = reorder(genelist, OR), y = -log10(pval), fill = OR)) + 
+# p = ggplot(data = gsea_res, aes(x = reorder(genelist, OR), y = -log10(pval), fill = OR)) + 
+p = ggplot(data = gsea_res, aes(x = reorder(genelist, -log10(pval)), y = -log10(pval), fill = OR)) + 
   geom_bar(stat = "identity") + 
   ylab("-log10(p)") + 
   xlab(" ") + 
@@ -716,7 +736,8 @@ gsea_res[,"fdr"] = p.adjust(gsea_res[,"pval"], method = "fdr")
 poslogfc_res = gsea_res
 gsea_res
 
-p = ggplot(data = gsea_res, aes(x = reorder(genelist, OR), y = -log10(pval), fill = OR)) + 
+# p = ggplot(data = gsea_res, aes(x = reorder(genelist, OR), y = -log10(pval), fill = OR)) + 
+p = ggplot(data = gsea_res, aes(x = reorder(genelist, -log10(pval)), y = -log10(pval), fill = OR)) + 
   geom_bar(stat = "identity") + 
   ylab("-log10(p)") + 
   xlab(" ") + 
@@ -744,7 +765,8 @@ gsea_res[,"fdr"] = p.adjust(gsea_res[,"pval"], method = "fdr")
 neglogfc_res = gsea_res
 gsea_res
 
-p = ggplot(data = gsea_res, aes(x = reorder(genelist, OR), y = -log10(pval), fill = OR)) + 
+# p = ggplot(data = gsea_res, aes(x = reorder(genelist, OR), y = -log10(pval), fill = OR)) + 
+p = ggplot(data = gsea_res, aes(x = reorder(genelist, -log10(pval)), y = -log10(pval), fill = OR)) + 
   geom_bar(stat = "identity") + 
   ylab("-log10(p)") + 
   xlab(" ") + 
@@ -933,7 +955,9 @@ neglogfc_sexhormone_res$type = "DE+"
 
 df_gsea = rbind(poslogfc_res, neglogfc_res, poslogfc_sexhormone_res, neglogfc_sexhormone_res)
 df_gsea$genelist = factor(df_gsea$genelist, 
-                          levels = rev(c("dup15q DE+","dup15q DE-", 
+                          levels = rev(c("dup15q iPSC",
+                                         "dup15q DE-","dup15q DE+", 
+                                         "AS iPSC",
                                          "SFARI", "ptLGD",
                                          "ASD DE+","ASD DE-",
                                          "SCZ DE","BD DE",
@@ -941,13 +965,18 @@ df_gsea$genelist = factor(df_gsea$genelist,
                                          "EST DE+","EST DE-",
                                          "AR Targets","ER Targets",
                                          "Male DT","Female DT","SexDiv DT")))
+df_gsea$type = factor(df_gsea$type, levels = c("DE+", "DE-"))
 df_gsea
 
 fontSize = 5
 p = ggplot(data = df_gsea) + 
   geom_tile(aes(y = genelist, x = type, fill= -log10(pval))) + 
   geom_text(aes(y=genelist, x=type,label = round(OR,2)), size = fontSize) + 
-  scale_fill_gradient(low = "white", high="red") + ylab("")+xlab("") +
+  # scale_fill_gradient(low = "white", high="red") + ylab("")+xlab("") +
+  scale_fill_gradient(low = "white", high="red",
+                      limits = c(0, 20), 
+                      oob = scales::squish) + ylab("")+xlab("") +
+  
   theme(
     # Remove panel border
     panel.border = element_blank(),  
